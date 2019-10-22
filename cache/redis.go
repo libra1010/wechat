@@ -4,12 +4,13 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/gomodule/redigo/redis"
+	"github.com/go-redis/redis/v7"
+	//"github.com/gomodule/redigo/redis"
 )
 
 //Redis redis cache
 type Redis struct {
-	conn *redis.Pool
+	conn *redis.Client
 }
 
 //RedisOpts redis 连接属性
@@ -22,46 +23,54 @@ type RedisOpts struct {
 	IdleTimeout int32  `yml:"idle_timeout" json:"idle_timeout"` //second
 }
 
+type SetinelRedisOpts struct {
+	MasterName    string
+	Password      string
+	Database      int
+	SentinelNodes []string
+}
+
 //NewRedis 实例化
 func NewRedis(opts *RedisOpts) *Redis {
-	pool := &redis.Pool{
-		MaxActive:   opts.MaxActive,
-		MaxIdle:     opts.MaxIdle,
-		IdleTimeout: time.Second * time.Duration(opts.IdleTimeout),
-		Dial: func() (redis.Conn, error) {
-			return redis.Dial("tcp", opts.Host,
-				redis.DialDatabase(opts.Database),
-				redis.DialPassword(opts.Password),
-			)
-		},
-		TestOnBorrow: func(conn redis.Conn, t time.Time) error {
-			if time.Since(t) < time.Minute {
-				return nil
-			}
-			_, err := conn.Do("PING")
-			return err
-		},
+
+	client := redis.NewClient(&redis.Options{
+		Addr:     opts.Host,
+		Password: opts.Password, // no password set
+		DB:       opts.Database, // use default DB
+	})
+
+	return &Redis{conn: client}
+}
+
+func NewSetinelRedis(opts *SetinelRedisOpts) *Redis {
+	sf := &redis.FailoverOptions{
+		// The master name.
+		MasterName: opts.MasterName,
+		// A seed list of host:port addresses of sentinel nodes.
+		SentinelAddrs: opts.SentinelNodes,
+
+		// Following options are copied from Options struct.
+		Password: opts.Password,
+		DB:       opts.Database,
 	}
-	return &Redis{pool}
+	client := redis.NewFailoverClient(sf)
+	return &Redis{conn: client}
 }
 
 //SetConn 设置conn
-func (r *Redis) SetConn(conn *redis.Pool) {
+func (r *Redis) SetConn(conn *redis.Client) {
 	r.conn = conn
 }
 
 //Get 获取一个值
 func (r *Redis) Get(key string) interface{} {
-	conn := r.conn.Get()
-	defer conn.Close()
-
-	var data []byte
-	var err error
-	if data, err = redis.Bytes(conn.Do("GET", key)); err != nil {
+	res, err := r.conn.Get(key).Result()
+	if err != nil {
 		return nil
 	}
+
 	var reply interface{}
-	if err = json.Unmarshal(data, &reply); err != nil {
+	if err = json.Unmarshal([]byte(res), &reply); err != nil {
 		return nil
 	}
 
@@ -70,26 +79,23 @@ func (r *Redis) Get(key string) interface{} {
 
 //Set 设置一个值
 func (r *Redis) Set(key string, val interface{}, timeout time.Duration) (err error) {
-	conn := r.conn.Get()
-	defer conn.Close()
 
 	var data []byte
 	if data, err = json.Marshal(val); err != nil {
 		return
 	}
 
-	_, err = conn.Do("SETEX", key, int64(timeout/time.Second), data)
-
+	err = r.conn.Set(key, data, timeout).Err()
 	return
+
 }
 
 //IsExist 判断key是否存在
 func (r *Redis) IsExist(key string) bool {
-	conn := r.conn.Get()
-	defer conn.Close()
+	exists := r.conn.Exists(key)
 
-	a, _ := conn.Do("EXISTS", key)
-	i := a.(int64)
+	i, _ := exists.Result()
+
 	if i > 0 {
 		return true
 	}
@@ -98,10 +104,9 @@ func (r *Redis) IsExist(key string) bool {
 
 //Delete 删除
 func (r *Redis) Delete(key string) error {
-	conn := r.conn.Get()
-	defer conn.Close()
+	status := r.conn.Del(key)
 
-	if _, err := conn.Do("DEL", key); err != nil {
+	if _, err := status.Result(); err != nil {
 		return err
 	}
 
